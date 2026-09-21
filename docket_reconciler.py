@@ -319,7 +319,7 @@ def plates_similar(a, b):
     if not a or not b or a == b:
         return False
     short, long_ = sorted((a, b), key=len)
-    if len(short) >= 2 and short in long_:
+    if len(short) >= 1 and short in long_:
         return True
     return min(len(a), len(b)) >= 4 and osa_distance(a, b) <= 1
 
