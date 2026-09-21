@@ -1,8 +1,5 @@
-import io
-import re
-import zipfile
-from collections import defaultdict
+streamlit
+pandas
+pdfplumber
+openpyxl
  
-import pandas as pd
-import pdfplumber
-import streamlit as st
