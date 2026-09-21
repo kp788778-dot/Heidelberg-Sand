@@ -92,6 +92,30 @@ def extract_individual_tonnages(page2):
 
 # ---------- NEW helpers (not in the original extractor) ----------
 
+# The extractor calls the sand "Heidelberg Sand"; for reporting it is Gaskell Sand.
+MATERIAL_LABELS = {"Heidelberg Sand": "Gaskell Sand"}
+
+
+def material_label(canonical):
+    return MATERIAL_LABELS.get(canonical, canonical)
+
+
+def classify_billed_material(text):
+    '''
+    Maps the billing file's product text (e.g. "FILL SAND BELL RD") to
+    "Gaskell Sand" or "Crushed Rock Basecourse". Returns "" if unrecognised.
+    '''
+    lower = str(text).lower()
+    if "sand" in lower:
+        return "Gaskell Sand"
+    if any(k in lower for k in (
+        "roadbase", "road base", "road-base", "basecourse", "base course",
+        "crushed", "rock",
+    )):
+        return "Crushed Rock Basecourse"
+    return ""
+
+
 def normalise_plate(text):
     '''Upper-case and strip everything except letters/digits: "1jav 672" -> "1JAV672".'''
     return re.sub(r"[^A-Z0-9]", "", str(text).upper())
@@ -166,7 +190,7 @@ def extract_docket_record(pdf_file, known_plates):
             "date": pd.to_datetime(date_str, format="%d/%m/%Y", errors="coerce"),
             "date_str": date_str,
             "truck": extract_truck_rego(page1, known_plates),
-            "material": extract_material(page2),
+            "material": material_label(extract_material(page2)),
             "total_tonnage": extract_total_tonnage(page2),
             "tonnages": extract_individual_tonnages(page2),
         }
@@ -220,14 +244,22 @@ def load_order_deliveries(file):
     status = raw["Delivery status"].astype(str) if "Delivery status" in raw.columns else ""
     qty = pd.to_numeric(raw[qty_col], errors="coerce")
 
+    text_cols = [c for c in ("Material", "Material description", "Customer material description")
+                 if c in raw.columns]
+    product_text = (
+        raw[text_cols].astype(str).agg(" ".join, axis=1) if text_cols
+        else pd.Series("", index=raw.index)
+    )
+
     df = pd.DataFrame({
         "Date": stamp.dt.normalize(),
         "Time": stamp.dt.strftime("%H:%M"),
         "Truck": raw["License plate"].map(normalise_plate),
+        "Material": product_text.map(classify_billed_material),
         "Delivery Docket": raw["Docket"].astype(str).str.replace(r"\.0$", "", regex=True),
         "Billed Tonnage": qty,
         "Delivery Status": status,
-        "Product": raw["Material description"] if "Material description" in raw.columns else "",
+        "Product": raw[text_cols[0]] if text_cols else "",
         "Order": raw["Order number"] if "Order number" in raw.columns else "",
         "Source File": file.name,
     })
@@ -246,152 +278,244 @@ def load_order_deliveries(file):
 DIFF_COL = "What's different"
 STATUS_MATCH = "Matched"
 STATUS_DIFF = "Tonnage differs"
+STATUS_REGO = "Rego differs"
+STATUS_REGO_DIFF = "Rego & tonnage differ"
 STATUS_BILLED_ONLY = "Billed - not on docket"
 STATUS_DOCKET_ONLY = "On docket - not billed"
+TRUCK_OK = "OK"
+TRUCK_REGO = "Rego typo"
+TRUCK_CHECK = "CHECK"
+
+RED_STATUSES = {TRUCK_CHECK, STATUS_BILLED_ONLY, STATUS_DOCKET_ONLY}
+AMBER_STATUSES = {STATUS_DIFF, STATUS_REGO, STATUS_REGO_DIFF, TRUCK_REGO}
 
 
 def cents(x):
     return int(round(float(x) * 100))
 
 
-def reconcile(dockets, billed, pair_threshold):
+def osa_distance(a, b):
+    '''Edit distance where one swapped pair of neighbouring characters counts as 1.'''
+    d = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(len(a) + 1):
+        d[i][0] = i
+    for j in range(len(b) + 1):
+        d[0][j] = j
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[-1][-1]
+
+
+def plates_similar(a, b):
     '''
-    Compares dockets to billed loads, per (date, truck):
-      1. Loads whose tonnage matches to the cent are paired first.
-      2. Leftover loads are paired by closest tonnage (if within pair_threshold t)
-         and reported as "Tonnage differs" - the typical typo/rounding case.
-      3. Anything still unpaired is "Billed - not on docket" or
-         "On docket - not billed".
+    True if two different regos look like the same truck entered differently:
+      - one is contained in the other  ("SW" in "SW25214"), or
+      - they are one typo / one swapped pair apart ("1JAV672" vs "1JAV627").
+    '''
+    if not a or not b or a == b:
+        return False
+    short, long_ = sorted((a, b), key=len)
+    if len(short) >= 2 and short in long_:
+        return True
+    return min(len(a), len(b)) >= 4 and osa_distance(a, b) <= 1
+
+
+def reconcile(dockets, billed, pair_threshold, rego_threshold=2.0, match_similar_rego=True):
+    '''
+    Compares docket loads to billed loads. Pairing happens in this order:
+      A. Same date + same rego, tonnage equal to the cent        -> "Matched"
+      B. Same date, DIFFERENT but similar regos, tonnage within
+         rego_threshold t (operator rego typo)                   -> "Rego differs" /
+                                                                    "Rego & tonnage differ"
+         Only attempted when at least one of the two regos does not appear on the
+         other side that day (guards against sequential fleet numbers such as
+         1IRP205 / 1IRP206, which are both real trucks).
+      C. Same date + same rego, closest tonnage within
+         pair_threshold t                                        -> "Tonnage differs"
+      D. Whatever is left -> "Billed - not on docket" / "On docket - not billed"
     Returns (load_df, truck_df).
     '''
-    d_groups = defaultdict(list)
+    d_loads = []
     for rec in dockets:
         for t in rec["tonnages"]:
-            d_groups[(rec["date"], rec["truck"])].append(
-                {"docket": rec["docket"], "tonnage": t, "pdf": rec["pdf_name"]}
-            )
+            d_loads.append({
+                "date": rec["date"], "truck": rec["truck"],
+                "docket": rec["docket"] or rec["pdf_name"], "tonnage": t,
+                "pdf": rec["pdf_name"], "material": rec["material"],
+            })
 
-    b_groups = defaultdict(list)
+    b_loads = []
     for _, r in billed.sort_values(["Date", "Time"], na_position="last").iterrows():
-        b_groups[(r["Date"], r["Truck"])].append(r)
+        b_loads.append({
+            "date": r["Date"], "truck": r["Truck"], "delivery": r["Delivery Docket"],
+            "time": r["Time"], "tonnage": float(r["Billed Tonnage"]),
+            "source": r["Source File"], "material": r["Material"],
+        })
 
-    def sort_key(k):
-        return (pd.Timestamp.max if pd.isna(k[0]) else k[0], k[1])
+    d_by_key, b_by_key = defaultdict(list), defaultdict(list)
+    for i, l in enumerate(d_loads):
+        d_by_key[(l["date"], l["truck"])].append(i)
+    for i, l in enumerate(b_loads):
+        b_by_key[(l["date"], l["truck"])].append(i)
 
-    rows = []
-    for key in sorted(set(d_groups) | set(b_groups), key=sort_key):
-        date, truck = key
-        d = d_groups.get(key, [])
-        b = b_groups.get(key, [])
+    pairs = []  # (docket idx, billed idx, kind)
+    free_d, free_b = set(range(len(d_loads))), set(range(len(b_loads)))
 
-        pairs = []  # (d_index, b_index)
-        free_d = set(range(len(d)))
-        free_b = set(range(len(b)))
+    def take(di, bi, kind):
+        pairs.append((di, bi, kind))
+        free_d.discard(di)
+        free_b.discard(bi)
 
-        # 1. exact matches
-        for i in sorted(free_d):
-            for j in sorted(free_b):
-                if cents(d[i]["tonnage"]) == cents(b[j]["Billed Tonnage"]):
-                    pairs.append((i, j))
-                    free_d.discard(i)
-                    free_b.discard(j)
+    # A. exact tonnage, same rego
+    for key, dis in d_by_key.items():
+        for di in dis:
+            for bi in b_by_key.get(key, []):
+                if bi in free_b and cents(d_loads[di]["tonnage"]) == cents(b_loads[bi]["tonnage"]):
+                    take(di, bi, "exact")
                     break
 
-        # 2. closest-tonnage pairing of the leftovers
-        candidates = sorted(
-            (abs(d[i]["tonnage"] - b[j]["Billed Tonnage"]), i, j)
-            for i in free_d for j in free_b
+    # B. similar (but different) regos, tonnage within rego_threshold
+    if match_similar_rego:
+        d_plates, b_plates = defaultdict(set), defaultdict(set)
+        for l in d_loads:
+            d_plates[l["date"]].add(l["truck"])
+        for l in b_loads:
+            b_plates[l["date"]].add(l["truck"])
+
+        cands = []
+        for di in free_d:
+            dl = d_loads[di]
+            for bi in free_b:
+                bl = b_loads[bi]
+                if dl["date"] != bl["date"] or dl["truck"] == bl["truck"]:
+                    continue
+                diff = abs(dl["tonnage"] - bl["tonnage"])
+                if diff > rego_threshold + 1e-9 or not plates_similar(dl["truck"], bl["truck"]):
+                    continue
+                orphan = (
+                    dl["truck"] not in b_plates[dl["date"]]
+                    or bl["truck"] not in d_plates[dl["date"]]
+                )
+                if orphan:
+                    cands.append((round(diff, 4), di, bi))
+        for diff, di, bi in sorted(cands):
+            if di in free_d and bi in free_b:
+                take(di, bi, "rego")
+
+    # C. same rego, closest tonnage within pair_threshold
+    for key, dis in d_by_key.items():
+        cands = sorted(
+            (abs(d_loads[di]["tonnage"] - b_loads[bi]["tonnage"]), di, bi)
+            for di in dis if di in free_d
+            for bi in b_by_key.get(key, []) if bi in free_b
         )
-        for diff, i, j in candidates:
-            if diff <= pair_threshold and i in free_d and j in free_b:
-                pairs.append((i, j))
-                free_d.discard(i)
-                free_b.discard(j)
+        for diff, di, bi in cands:
+            if diff <= pair_threshold and di in free_d and bi in free_b:
+                take(di, bi, "near")
 
-        def base(i=None, j=None):
-            dd = d[i] if i is not None else None
-            bb = b[j] if j is not None else None
-            billed_t = float(bb["Billed Tonnage"]) if bb is not None else None
-            docket_t = dd["tonnage"] if dd is not None else None
-            return {
-                "Date": date,
-                "Truck": truck,
-                "Docket": dd["docket"] if dd else "",
-                "Docket Tonnage": docket_t,
-                "Billed Delivery Docket": bb["Delivery Docket"] if bb is not None else "",
-                "Billed Time": bb["Time"] if bb is not None else "",
-                "Billed Tonnage": billed_t,
-                "Billed - Docket (t)": (
-                    round(billed_t - docket_t, 2)
-                    if billed_t is not None and docket_t is not None else
-                    (billed_t if billed_t is not None else -docket_t)
-                ),
-                "Source File": bb["Source File"] if bb is not None else "",
-                "Docket PDF": dd["pdf"] if dd else "",
-            }
+    # ---- build load rows ----
+    def make_row(di, bi, status, note):
+        dl = d_loads[di] if di is not None else None
+        bl = b_loads[bi] if bi is not None else None
+        docket_t = dl["tonnage"] if dl else None
+        billed_t = bl["tonnage"] if bl else None
+        if dl and bl:
+            diff = round(billed_t - docket_t, 2)
+        else:
+            diff = billed_t if bl else -docket_t
+        return {
+            "Date": (bl or dl)["date"],
+            "Truck": bl["truck"] if bl else dl["truck"],
+            "Material": (dl["material"] if dl and dl["material"] else (bl["material"] if bl else "")),
+            "Docket Rego": dl["truck"] if dl else "",
+            "Docket": dl["docket"] if dl else "",
+            "Docket Tonnage": docket_t,
+            "Billed Delivery Docket": bl["delivery"] if bl else "",
+            "Billed Time": bl["time"] if bl else "",
+            "Billed Tonnage": billed_t,
+            "Billed - Docket (t)": diff,
+            "Status": status,
+            "Note": note,
+            "Source File": bl["source"] if bl else "",
+            "Docket PDF": dl["pdf"] if dl else "",
+        }
 
-        truck_has_docket = bool(d)
-        truck_has_billing = bool(b)
+    def sort_key(row, group, idx):
+        date = pd.Timestamp.max if pd.isna(row["Date"]) else row["Date"]
+        return (date, row["Truck"], group, idx)
 
-        for i, j in sorted(pairs):
-            row = base(i, j)
-            same = cents(d[i]["tonnage"]) == cents(b[j]["Billed Tonnage"])
-            row["Status"] = STATUS_MATCH if same else STATUS_DIFF
-            row["Note"] = ""
-            rows.append(row)
-        for j in sorted(free_b):
-            row = base(None, j)
-            row["Status"] = STATUS_BILLED_ONLY
-            row["Note"] = "" if truck_has_docket else "No docket uploaded for this truck on this date"
-            rows.append(row)
-        for i in sorted(free_d):
-            row = base(i, None)
-            row["Status"] = STATUS_DOCKET_ONLY
-            row["Note"] = "" if truck_has_billing else "Truck not in billing file for this date"
-            rows.append(row)
+    keyed = []
+    for di, bi, kind in pairs:
+        note = ""
+        if kind == "exact":
+            status = STATUS_MATCH
+        elif kind == "near":
+            status = STATUS_DIFF
+        else:
+            same = cents(d_loads[di]["tonnage"]) == cents(b_loads[bi]["tonnage"])
+            status = STATUS_REGO if same else STATUS_REGO_DIFF
+            note = (f"Docket rego '{d_loads[di]['truck']}' is similar to billed rego "
+                    f"'{b_loads[bi]['truck']}' - likely entered incorrectly")
+        row = make_row(di, bi, status, note)
+        keyed.append((sort_key(row, 0, di), row))
+    for bi in free_b:
+        bl = b_loads[bi]
+        note = "" if d_by_key.get((bl["date"], bl["truck"])) else \
+            "No docket uploaded for this truck on this date"
+        row = make_row(None, bi, STATUS_BILLED_ONLY, note)
+        keyed.append((sort_key(row, 1, bi), row))
+    for di in free_d:
+        dl = d_loads[di]
+        note = "" if b_by_key.get((dl["date"], dl["truck"])) else \
+            "Truck not in billing file for this date"
+        row = make_row(di, None, STATUS_DOCKET_ONLY, note)
+        keyed.append((sort_key(row, 2, di), row))
 
-    load_df = pd.DataFrame(rows)
+    load_df = pd.DataFrame([r for _, r in sorted(keyed, key=lambda x: x[0])])
     if load_df.empty:
         return load_df, pd.DataFrame()
 
     # ---- one row per truck per day ----
-    docket_totals = defaultdict(float)
-    docket_lists = defaultdict(list)
-    stated_totals = defaultdict(float)
-    check_notes = defaultdict(list)
+    stated_notes = {}
     for rec in dockets:
-        k = (rec["date"], rec["truck"])
         loads_sum = round(sum(rec["tonnages"]), 2)
-        docket_totals[k] += loads_sum
-        docket_lists[k].append(rec["docket"] or rec["pdf_name"])
         stated = rec["total_tonnage"] if isinstance(rec["total_tonnage"], (int, float)) else loads_sum
-        stated_totals[k] += stated
         if abs(stated - loads_sum) > 0.005:
-            check_notes[k].append(
+            stated_notes[rec["docket"] or rec["pdf_name"]] = (
                 f"{rec['docket']}: stated total {stated:.2f} t but loads add to {loads_sum:.2f} t"
             )
 
     truck_rows = []
     for (date, truck), g in load_df.groupby(["Date", "Truck"], sort=False, dropna=False):
-        k = (date, truck)
         docket_sum = round(g["Docket Tonnage"].sum(), 2)
         billed_sum = round(g["Billed Tonnage"].sum(), 2)
-        n_docket = int(g["Docket Tonnage"].notna().sum())
-        n_billed = int(g["Billed Tonnage"].notna().sum())
+        dockets_here = [x for x in dict.fromkeys(g["Docket"]) if x]
+        notes = [stated_notes[x] for x in dockets_here if x in stated_notes]
         bad = g[g["Status"] != STATUS_MATCH]
+        kinds = set(bad["Status"])
+        if (kinds - {STATUS_REGO}) or notes:
+            status = TRUCK_CHECK
+        elif kinds:
+            status = TRUCK_REGO
+        else:
+            status = TRUCK_OK
         truck_rows.append({
             "Date": date,
             "Truck": truck,
-            "Dockets": ", ".join(docket_lists.get(k, [])) or "(none)",
-            "Docket Loads": n_docket,
+            "Material": ", ".join(dict.fromkeys(m for m in g["Material"] if m)),
+            "Dockets": ", ".join(dockets_here) or "(none)",
+            "Docket Loads": int(g["Docket Tonnage"].notna().sum()),
             "Docket Total (t)": docket_sum,
-            "Billed Loads": n_billed,
+            "Billed Loads": int(g["Billed Tonnage"].notna().sum()),
             "Billed Total (t)": billed_sum,
             "Billed - Docket (t)": round(billed_sum - docket_sum, 2),
-            "Status": "OK" if bad.empty and not check_notes.get(k) else "CHECK",
+            "Status": status,
             DIFF_COL: "; ".join(
-                [f"{s}: {n}" for s, n in bad["Status"].value_counts().items()]
-                + check_notes.get(k, [])
+                [f"{s}: {n}" for s, n in bad["Status"].value_counts().items()] + notes
             ),
         })
     return load_df, pd.DataFrame(truck_rows)
@@ -439,9 +563,9 @@ def build_report(truck_df, load_df, docket_df, excluded_df):
                 for row in ws.iter_rows(min_row=2):
                     val = row[idx - 1].value
                     fill = None
-                    if val == "CHECK" or val in (STATUS_BILLED_ONLY, STATUS_DOCKET_ONLY):
+                    if val in RED_STATUSES:
                         fill = red
-                    elif val == STATUS_DIFF:
+                    elif val in AMBER_STATUSES:
                         fill = amber
                     if fill:
                         for c in row:
@@ -458,9 +582,9 @@ def build_report(truck_df, load_df, docket_df, excluded_df):
 def style_status(df):
     def colour(row):
         s = row.get("Status")
-        if s in ("CHECK", STATUS_BILLED_ONLY, STATUS_DOCKET_ONLY):
+        if s in RED_STATUSES:
             return ["background-color: #f8cbad; color: #000"] * len(row)
-        if s == STATUS_DIFF:
+        if s in AMBER_STATUSES:
             return ["background-color: #ffe699; color: #000"] * len(row)
         return [""] * len(row)
 
@@ -485,10 +609,18 @@ def render_results(res):
     c[3].metric("Loads matched", int((load_df["Status"] == STATUS_MATCH).sum()))
     c[4].metric("Loads needing review", n_issues)
 
-    if n_issues == 0 and (truck_df["Status"] == "OK").all():
+    n_rego = int(load_df["Status"].isin([STATUS_REGO, STATUS_REGO_DIFF]).sum())
+    if n_rego:
+        st.info(
+            f"{n_rego} load(s) were paired despite a rego mismatch between docket and billing "
+            "(likely operator entry errors). They are not counted as missing loads but are "
+            "listed below so the rego can be corrected."
+        )
+
+    if n_issues == 0 and (truck_df["Status"] == TRUCK_OK).all():
         st.success("Everything reconciles - no discrepancies found.")
     else:
-        st.error(f"{n_issues} load(s) don't reconcile. Details below.")
+        st.error(f"{n_issues} load(s) need review. Details below.")
 
     st.subheader("Issues")
     issues = load_df[load_df["Status"] != STATUS_MATCH]
@@ -542,6 +674,15 @@ def main():
                  "as 'Tonnage differs' if they are within this many tonnes of each other. "
                  "Otherwise they are listed as separate missing loads.",
         )
+        match_similar_rego = st.checkbox(
+            "Match loads with similar regos (operator typos)", value=True,
+            help="e.g. 'SW' on the docket vs 'SW25214' in billing.",
+        )
+        rego_threshold = st.number_input(
+            "Max tonnage gap for similar-rego matches (t)",
+            min_value=0.0, max_value=50.0, value=2.0, step=0.5,
+            disabled=not match_similar_rego,
+        )
 
     left, right = st.columns(2)
     with left:
@@ -578,6 +719,13 @@ def main():
         excluded_df = pd.concat(excluded, ignore_index=True)
         known_plates = frozenset(billed["Truck"].unique())
 
+        unknown_products = sorted(set(billed.loc[billed["Material"] == "", "Product"].astype(str)))
+        if unknown_products:
+            st.warning(
+                "Couldn't classify the material for billed product(s): "
+                + ", ".join(unknown_products) + ". Their Material cell will be blank."
+            )
+
         # ---- docket PDFs ----
         pdfs = collect_pdfs(docket_files)
         if not pdfs:
@@ -599,6 +747,8 @@ def main():
                     st.warning(f"No truck rego found in **{rec['pdf_name']}** - its loads can't be matched.")
                 if pd.isna(rec["date"]):
                     st.warning(f"No date found in **{rec['pdf_name']}**.")
+                if not rec["material"]:
+                    st.warning(f"Material not detected in **{rec['pdf_name']}**.")
                 if not rec["tonnages"]:
                     st.warning(f"No load tonnages found in **{rec['pdf_name']}**.")
             progress.progress((i + 1) / len(pdfs))
@@ -608,7 +758,9 @@ def main():
             st.error("No dockets could be read.")
             st.stop()
 
-        load_df, truck_df = reconcile(records, billed, pair_threshold)
+        load_df, truck_df = reconcile(
+            records, billed, pair_threshold, rego_threshold, match_similar_rego
+        )
 
         docket_df = pd.DataFrame([{
             "PDF": r["pdf_name"], "Docket": r["docket"], "Date": r["date"],
